@@ -763,3 +763,298 @@ class NormalizeReward(gym.Wrapper):
         rews = rews * (self.reward_range[1] - self.reward_range[0] + 1e-12) + self.reward_range[0]
 
         return rews
+
+
+class RewardFinalWSOWrapper(RewardWrapper):
+    """Sparse reward wrapper that gives WSO only at episode termination.
+
+    This implements a sparse reward strategy where the agent receives the final
+    WSO (Weight Storage Organs) value only when the episode ends. All intermediate
+    steps receive zero reward.
+
+    This encourages the agent to focus on maximizing the final yield rather than
+    short-term gains.
+    """
+
+    def __init__(self, env: gym.Env, args: Namespace) -> None:
+        """Initialize the :class:`RewardFinalWSOWrapper` wrapper with an environment.
+
+        Args:
+            env: The environment to apply the wrapper
+            args: Namespace containing environment arguments (not used but kept for compatibility)
+        """
+        super().__init__(env)
+        self.env = env
+        self.reward_range = [0, 10000]
+
+    def _get_reward(self, output: dict, act_tuple: tuple[float, float, float, float]) -> float:
+        """Returns WSO only at episode termination, 0 otherwise.
+
+        The termination/truncation check is done in the step() method of RewardWrapper.
+        Here we simply return 0 for all steps. The final step will override this
+        with the actual WSO value.
+
+        Args:
+            output: dict - output from model
+            act_tuple: tuple - NPK/Water amounts (not used in this reward)
+
+        Returns:
+            0.0 for intermediate steps
+        """
+        # For intermediate steps, return 0
+        # The final reward will be set in step() when termination/truncation occurs
+        return 0.0
+
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
+        """Run one timestep of the environment's dynamics.
+
+        Overrides the parent step() to provide sparse reward.
+
+        Args:
+            action: integer action
+
+        Returns:
+            observation, reward, terminated, truncated, info
+        """
+        if isinstance(action, dict):
+            msg = f"Action must be of type `int` but is of type `dict`. Wrap environment in `pcse_gym.wrappers.NPKDictActionWrapper` before proceeding."
+            raise Exception(msg)
+
+        act_tuple = self.env.unwrapped._take_action(action)
+        output = self.env.unwrapped._run_simulation()
+        observation = self.env.unwrapped._process_output(output)
+
+        # Terminate based on crop finishing
+        if isinstance(self.env.unwrapped, Multi_NPK_Env):
+            termination = np.prod(
+                [
+                    output[i][-1]["FIN"] == 1.0 or output[i][-1]["FIN"] is None
+                    for i in range(self.env.unwrapped.num_farms)
+                ]
+            )
+            if np.any([output[i][-1]["FIN"] is None for i in range(self.env.unwrapped.num_farms)]):
+                observation = np.nan_to_num(observation)
+        else:
+            termination = output[-1]["FIN"] == 1.0 or output[-1]["FIN"] is None
+            if output[-1]["FIN"] is None:
+                observation = np.nan_to_num(observation)
+
+        # Truncate based on site end date
+        truncation = self.env.unwrapped.date >= self.env.unwrapped.site_end_date
+
+        # Sparse reward: only give WSO at termination or truncation
+        if termination or truncation:
+            if isinstance(self.env.unwrapped, Multi_NPK_Env):
+                reward = sum(
+                    [output[i][-1]["WSO"] if output[i][-1]["WSO"] is not None else 0.0
+                     for i in range(self.env.unwrapped.num_farms)]
+                )
+            else:
+                reward = output[-1]["WSO"] if output[-1]["WSO"] is not None else 0.0
+        else:
+            reward = 0.0
+
+        # Log results
+        if isinstance(self.env.unwrapped, Multi_NPK_Env):
+            self.env.unwrapped._log(
+                [output[i][-1]["WSO"] for i in range(self.env.unwrapped.num_farms)], act_tuple, reward
+            )
+        else:
+            self.env.unwrapped._log(output[-1]["WSO"], act_tuple, reward)
+
+        return observation, reward, termination, truncation, self.env.unwrapped.log
+
+
+class RewardWSODeltaWrapper(RewardWrapper):
+    """Dense reward wrapper that gives WSO delta at each step.
+
+    This implements a dense reward strategy where the agent receives the change
+    in WSO (Weight Storage Organs) at each step as reward. The reward is:
+    reward = WSO(t) - WSO(t-1)
+
+    This provides more frequent feedback to guide learning, helping the agent
+    understand which actions lead to WSO increases.
+    """
+
+    def __init__(self, env: gym.Env, args: Namespace) -> None:
+        """Initialize the :class:`RewardWSODeltaWrapper` wrapper with an environment.
+
+        Args:
+            env: The environment to apply the wrapper
+            args: Namespace containing environment arguments (not used but kept for compatibility)
+        """
+        super().__init__(env)
+        self.env = env
+        self.prev_wso = 0.0
+        self.reward_range = [-1500, 500]  # Based on observed WSO delta range with margin
+
+    def _get_reward(self, output: dict, act_tuple: tuple[float, float, float, float]) -> float:
+        """Returns the change in WSO as reward.
+
+        Args:
+            output: dict - output from model
+            act_tuple: tuple - NPK/Water amounts (not used in this reward)
+
+        Returns:
+            WSO(t) - WSO(t-1)
+        """
+        # Get current WSO
+        if isinstance(self.env.unwrapped, Multi_NPK_Env):
+            current_wso = sum(
+                [output[i][-1]["WSO"] if output[i][-1]["WSO"] is not None else 0.0
+                 for i in range(self.env.unwrapped.num_farms)]
+            )
+        else:
+            current_wso = output[-1]["WSO"] if output[-1]["WSO"] is not None else 0.0
+
+        # Calculate delta
+        reward = current_wso - self.prev_wso
+
+        # Update previous WSO for next step
+        self.prev_wso = current_wso
+
+        return reward
+
+    def reset(self, **kwargs: dict) -> tuple[np.ndarray, dict]:
+        """Reset the environment and reset previous WSO.
+
+        Args:
+            **kwargs: keyword arguments to pass to base reset
+
+        Returns:
+            observation, info
+        """
+        obs, info = self.env.reset(**kwargs)
+
+        # Reset previous WSO to 0
+        self.prev_wso = 0.0
+
+        return obs, info
+
+
+class RewardPeakWSOWrapper(RewardWrapper):
+    """Sparse reward wrapper that gives peak WSO at episode termination.
+
+    This implements a sparse reward strategy where the agent receives the maximum
+    WSO (Weight Storage Organs) value observed during the episode, only when the
+    episode ends. All intermediate steps receive zero reward.
+
+    This is more appropriate than final WSO for crops where WSO declines after
+    reaching maturity. It rewards the agent for maximizing crop yield potential
+    regardless of harvest timing, which better reflects agricultural management quality.
+    """
+
+    def __init__(self, env: gym.Env, args: Namespace) -> None:
+        """Initialize the :class:`RewardPeakWSOWrapper` wrapper with an environment.
+
+        Args:
+            env: The environment to apply the wrapper
+            args: Namespace containing environment arguments (not used but kept for compatibility)
+        """
+        super().__init__(env)
+        self.env = env
+        self.peak_wso = 0.0
+        self.reward_range = [0, 15000]  # Based on observed peak WSO range (~12590) with margin
+
+    def _get_reward(self, output: dict, act_tuple: tuple[float, float, float, float]) -> float:
+        """Track peak WSO but return 0 for intermediate steps.
+
+        Args:
+            output: dict - output from model
+            act_tuple: tuple - NPK/Water amounts (not used in this reward)
+
+        Returns:
+            0.0 for intermediate steps (actual reward set in step() at termination)
+        """
+        # Update peak WSO
+        if isinstance(self.env.unwrapped, Multi_NPK_Env):
+            current_wso = sum(
+                [output[i][-1]["WSO"] if output[i][-1]["WSO"] is not None else 0.0
+                 for i in range(self.env.unwrapped.num_farms)]
+            )
+        else:
+            current_wso = output[-1]["WSO"] if output[-1]["WSO"] is not None else 0.0
+
+        self.peak_wso = max(self.peak_wso, current_wso)
+
+        return 0.0
+
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
+        """Run one timestep of the environment's dynamics.
+
+        Overrides the parent step() to provide sparse reward based on peak WSO.
+
+        Args:
+            action: integer action
+
+        Returns:
+            observation, reward, terminated, truncated, info
+        """
+        if isinstance(action, dict):
+            msg = f"Action must be of type `int` but is of type `dict`. Wrap environment in `pcse_gym.wrappers.NPKDictActionWrapper` before proceeding."
+            raise Exception(msg)
+
+        act_tuple = self.env.unwrapped._take_action(action)
+        output = self.env.unwrapped._run_simulation()
+        observation = self.env.unwrapped._process_output(output)
+
+        # Update peak WSO
+        if isinstance(self.env.unwrapped, Multi_NPK_Env):
+            current_wso = sum(
+                [output[i][-1]["WSO"] if output[i][-1]["WSO"] is not None else 0.0
+                 for i in range(self.env.unwrapped.num_farms)]
+            )
+        else:
+            current_wso = output[-1]["WSO"] if output[-1]["WSO"] is not None else 0.0
+
+        self.peak_wso = max(self.peak_wso, current_wso)
+
+        # Terminate based on crop finishing
+        if isinstance(self.env.unwrapped, Multi_NPK_Env):
+            termination = np.prod(
+                [
+                    output[i][-1]["FIN"] == 1.0 or output[i][-1]["FIN"] is None
+                    for i in range(self.env.unwrapped.num_farms)
+                ]
+            )
+            if np.any([output[i][-1]["FIN"] is None for i in range(self.env.unwrapped.num_farms)]):
+                observation = np.nan_to_num(observation)
+        else:
+            termination = output[-1]["FIN"] == 1.0 or output[-1]["FIN"] is None
+            if output[-1]["FIN"] is None:
+                observation = np.nan_to_num(observation)
+
+        # Truncate based on site end date
+        truncation = self.env.unwrapped.date >= self.env.unwrapped.site_end_date
+
+        # Sparse reward: only give peak WSO at termination or truncation
+        if termination or truncation:
+            reward = self.peak_wso
+        else:
+            reward = 0.0
+
+        # Log results
+        if isinstance(self.env.unwrapped, Multi_NPK_Env):
+            self.env.unwrapped._log(
+                [output[i][-1]["WSO"] for i in range(self.env.unwrapped.num_farms)], act_tuple, reward
+            )
+        else:
+            self.env.unwrapped._log(output[-1]["WSO"], act_tuple, reward)
+
+        return observation, reward, termination, truncation, self.env.unwrapped.log
+
+    def reset(self, **kwargs: dict) -> tuple[np.ndarray, dict]:
+        """Reset the environment and reset peak WSO tracker.
+
+        Args:
+            **kwargs: keyword arguments to pass to base reset
+
+        Returns:
+            observation, info
+        """
+        obs, info = self.env.reset(**kwargs)
+
+        # Reset peak WSO to 0
+        self.peak_wso = 0.0
+
+        return obs, info

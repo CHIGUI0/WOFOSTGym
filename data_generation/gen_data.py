@@ -59,7 +59,7 @@ class DataArgs(utils.Args):
     lon_high: float = 5
 
     """Cuda setting for RL agents"""
-    cuda = True
+    cuda: bool = True
 
 
 def csv(env, args, pol):
@@ -124,24 +124,26 @@ def npz(env: gym.Env, args: DataArgs, pol: Agent) -> None:
     rewards_arr = []
     info_arr = []
 
+    device = torch.device("cuda" if args.agent_type and args.cuda and torch.cuda.is_available() else "cpu")
+
     for pair in loc_yr:
         obs, _ = env.reset(**{"year": pair[1], "location": pair[0]})
 
         term, trunc = False, False
         if hasattr(pol, "lstm"):
             next_lstm_state = (
-                torch.zeros(policy.lstm.num_layers, 1, policy.lstm.hidden_size).to(device),
-                torch.zeros(policy.lstm.num_layers, 1, policy.lstm.hidden_size).to(device),
+                torch.zeros(pol.lstm.num_layers, 1, pol.lstm.hidden_size).to(device),
+                torch.zeros(pol.lstm.num_layers, 1, pol.lstm.hidden_size).to(device),
             )  # hidden and cell states (see https://youtu.be/8HyCNIVRbSU)
 
         while not term:
             if args.agent_type:
-                obs = torch.from_numpy(obs).float().to("cuda")
+                obs = torch.from_numpy(obs).float().to(device)
 
             if hasattr(pol, "lstm"):
                 next_done = np.logical_or([term], [trunc])
-                next_done = torch.Tensor(next_done).to(device)
-                action, next_lstm_state = policy.get_action(obs, next_lstm_state, next_done)
+                next_done = torch.tensor(next_done, device=device, dtype=torch.float32)
+                action, next_lstm_state = pol.get_action(obs, next_lstm_state, next_done)
             else:
                 action = pol.get_action(obs)
             next_obs, reward, term, trunc, info = env.step(action)
@@ -157,7 +159,7 @@ def npz(env: gym.Env, args: DataArgs, pol: Agent) -> None:
             dones_arr.append(term)
 
             if isinstance(reward, torch.Tensor):
-                reward.cpu().numpy().flatten()[0]
+                reward = reward.detach().cpu().numpy().flatten()[0]
             elif isinstance(reward, np.ndarray):
                 reward = reward.flatten()[0]
 
@@ -210,7 +212,14 @@ if __name__ == "__main__":
         assert isinstance(
             args.agent_path, str
         ), f" `--args.agent-path` is `{args.agent_path}` (incorrectly specified) and no Pre Specified Policy is provided"
-        assert os.path.isfile(f"{os.getcwd()}/{args.agent_path}"), f"`{args.agent_path}` is not a valid file"
+
+        # Handle both absolute and relative paths
+        if os.path.isabs(args.agent_path):
+            agent_full_path = args.agent_path
+        else:
+            agent_full_path = os.path.join(os.getcwd(), args.agent_path)
+
+        assert os.path.isfile(agent_full_path), f"`{args.agent_path}` is not a valid file (resolved to: {agent_full_path})"
         assert args.agent_path.endswith(".pt"), f"`{args.agent_path}` must be a valid `.pt` file"
 
         envs = gym.vector.SyncVectorEnv(
@@ -226,7 +235,7 @@ if __name__ == "__main__":
 
         device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
         try:
-            state_dict = torch.load(f"{args.agent_path}", map_location=device, weights_only=True)
+            state_dict = torch.load(agent_full_path, map_location=device, weights_only=True)
             if args.agent_type in ["BC", "GAIL", "AIRL"]:
                 state_dict = {f"policy.{k}": v for k, v in state_dict.items()}
             policy.load_state_dict(state_dict)

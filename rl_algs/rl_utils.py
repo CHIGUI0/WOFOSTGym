@@ -66,6 +66,12 @@ def make_env(kwargs: Namespace, idx: int = 1, capture_video: bool = False, run_n
         else:
             env = utils.make_gym_env(kwargs, run_name=run_name)
         env = utils.wrap_env_reward(env, kwargs)
+
+        # Add RecordEpisodeStatistics wrapper - CRITICAL for episode tracking
+        # This wrapper tracks episode returns and lengths, and adds them to info["final_info"]
+        # when an episode ends. Without it, AsyncVectorEnv won't generate final_info.
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+
         env = wrappers.NormalizeObservation(env)
         env = wrappers.NormalizeReward(env)
         return env
@@ -92,7 +98,7 @@ def setup(kwargs: Namespace, args: Namespace, run_name: str) -> tuple[SummaryWri
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            sync_tensorboard=False,  # We use wandb.log() directly instead
             config=vars(args),
             name=run_name,
             monitor_gym=True,
@@ -111,9 +117,16 @@ def setup(kwargs: Namespace, args: Namespace, run_name: str) -> tuple[SummaryWri
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(kwargs, i, args.capture_video, run_name) for i in range(args.num_envs)],
-    )
+    # Use AsyncVectorEnv for true multiprocessing when num_envs > 1
+    # Use SyncVectorEnv for single environment to avoid multiprocessing overhead
+    if args.num_envs > 1:
+        envs = gym.vector.AsyncVectorEnv(
+            [make_env(kwargs, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        )
+    else:
+        envs = gym.vector.SyncVectorEnv(
+            [make_env(kwargs, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     return writer, device, envs
@@ -128,18 +141,33 @@ def eval_policy(
     """
     avg_reward = 0.0
 
-    if isinstance(eval_env, gym.vector.SyncVectorEnv):
-        env_constr = type(eval_env.envs[0].unwrapped)
-        args = eval_env.envs[0].unwrapped.args
-        base_fpath = eval_env.envs[0].unwrapped.base_fpath
-        agro_fpath = eval_env.envs[0].unwrapped.agro_fpath
-        site_fpath = eval_env.envs[0].unwrapped.site_fpath
-        crop_fpath = eval_env.envs[0].unwrapped.crop_fpath
-        name_fpath = eval_env.envs[0].unwrapped.name_fpath
-        unit_fpath = eval_env.envs[0].unwrapped.unit_fpath
-        range_fpath = eval_env.envs[0].unwrapped.range_fpath
-        render_mode = eval_env.envs[0].unwrapped.render_mode
-        config = eval_env.envs[0].unwrapped.config
+    # Handle both SyncVectorEnv and AsyncVectorEnv
+    if isinstance(eval_env, (gym.vector.SyncVectorEnv, gym.vector.AsyncVectorEnv)):
+        # For AsyncVectorEnv, we need to call get_attr to access attributes from worker processes
+        if isinstance(eval_env, gym.vector.AsyncVectorEnv):
+            env_constr = eval_env.get_attr('unwrapped')[0].__class__
+            args = eval_env.get_attr('args')[0]
+            base_fpath = eval_env.get_attr('base_fpath')[0]
+            agro_fpath = eval_env.get_attr('agro_fpath')[0]
+            site_fpath = eval_env.get_attr('site_fpath')[0]
+            crop_fpath = eval_env.get_attr('crop_fpath')[0]
+            name_fpath = eval_env.get_attr('name_fpath')[0]
+            unit_fpath = eval_env.get_attr('unit_fpath')[0]
+            range_fpath = eval_env.get_attr('range_fpath')[0]
+            render_mode = eval_env.get_attr('render_mode')[0]
+            config = eval_env.get_attr('config')[0]
+        else:  # SyncVectorEnv
+            env_constr = type(eval_env.envs[0].unwrapped)
+            args = eval_env.envs[0].unwrapped.args
+            base_fpath = eval_env.envs[0].unwrapped.base_fpath
+            agro_fpath = eval_env.envs[0].unwrapped.agro_fpath
+            site_fpath = eval_env.envs[0].unwrapped.site_fpath
+            crop_fpath = eval_env.envs[0].unwrapped.crop_fpath
+            name_fpath = eval_env.envs[0].unwrapped.name_fpath
+            unit_fpath = eval_env.envs[0].unwrapped.unit_fpath
+            range_fpath = eval_env.envs[0].unwrapped.range_fpath
+            render_mode = eval_env.envs[0].unwrapped.render_mode
+            config = eval_env.envs[0].unwrapped.config
     else:
         env_constr = type(eval_env.unwrapped)
         args = eval_env.unwrapped.args
@@ -185,6 +213,9 @@ def eval_policy(
 
             if isinstance(eval_env, gym.vector.SyncVectorEnv):
                 avg_reward += eval_env.envs[0].unnormalize(reward)
+            elif isinstance(eval_env, gym.vector.AsyncVectorEnv):
+                # For AsyncVectorEnv, call unnormalize via call method
+                avg_reward += eval_env.call('unnormalize', reward)[0]
             else:
                 avg_reward += eval_env.unnormalize(reward)
 
@@ -204,18 +235,33 @@ def eval_policy_lstm(
 
     assert hasattr(policy, "lstm"), "Calling `eval_policy_lstm` with a policy that does not have a LSTM!"
 
-    if isinstance(eval_env, gym.vector.SyncVectorEnv):
-        env_constr = type(eval_env.envs[0].unwrapped)
-        args = eval_env.envs[0].unwrapped.args
-        base_fpath = eval_env.envs[0].unwrapped.base_fpath
-        agro_fpath = eval_env.envs[0].unwrapped.agro_fpath
-        site_fpath = eval_env.envs[0].unwrapped.site_fpath
-        crop_fpath = eval_env.envs[0].unwrapped.crop_fpath
-        name_fpath = eval_env.envs[0].unwrapped.name_fpath
-        unit_fpath = eval_env.envs[0].unwrapped.unit_fpath
-        range_fpath = eval_env.envs[0].unwrapped.range_fpath
-        render_mode = eval_env.envs[0].unwrapped.render_mode
-        config = eval_env.envs[0].unwrapped.config
+    # Handle both SyncVectorEnv and AsyncVectorEnv
+    if isinstance(eval_env, (gym.vector.SyncVectorEnv, gym.vector.AsyncVectorEnv)):
+        # For AsyncVectorEnv, we need to call get_attr to access attributes from worker processes
+        if isinstance(eval_env, gym.vector.AsyncVectorEnv):
+            env_constr = eval_env.get_attr('unwrapped')[0].__class__
+            args = eval_env.get_attr('args')[0]
+            base_fpath = eval_env.get_attr('base_fpath')[0]
+            agro_fpath = eval_env.get_attr('agro_fpath')[0]
+            site_fpath = eval_env.get_attr('site_fpath')[0]
+            crop_fpath = eval_env.get_attr('crop_fpath')[0]
+            name_fpath = eval_env.get_attr('name_fpath')[0]
+            unit_fpath = eval_env.get_attr('unit_fpath')[0]
+            range_fpath = eval_env.get_attr('range_fpath')[0]
+            render_mode = eval_env.get_attr('render_mode')[0]
+            config = eval_env.get_attr('config')[0]
+        else:  # SyncVectorEnv
+            env_constr = type(eval_env.envs[0].unwrapped)
+            args = eval_env.envs[0].unwrapped.args
+            base_fpath = eval_env.envs[0].unwrapped.base_fpath
+            agro_fpath = eval_env.envs[0].unwrapped.agro_fpath
+            site_fpath = eval_env.envs[0].unwrapped.site_fpath
+            crop_fpath = eval_env.envs[0].unwrapped.crop_fpath
+            name_fpath = eval_env.envs[0].unwrapped.name_fpath
+            unit_fpath = eval_env.envs[0].unwrapped.unit_fpath
+            range_fpath = eval_env.envs[0].unwrapped.range_fpath
+            render_mode = eval_env.envs[0].unwrapped.render_mode
+            config = eval_env.envs[0].unwrapped.config
     else:
         env_constr = type(eval_env.unwrapped)
         args = eval_env.unwrapped.args
@@ -268,6 +314,9 @@ def eval_policy_lstm(
             state, reward, term, trunc, _ = env.step(action.detach().cpu().numpy())
             if isinstance(eval_env, gym.vector.SyncVectorEnv):
                 avg_reward += eval_env.envs[0].unnormalize(reward)
+            elif isinstance(eval_env, gym.vector.AsyncVectorEnv):
+                # For AsyncVectorEnv, call unnormalize via call method
+                avg_reward += eval_env.call('unnormalize', reward)[0]
             else:
                 avg_reward += eval_env.unnormalize(reward)
 
