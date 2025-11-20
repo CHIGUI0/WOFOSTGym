@@ -8,6 +8,7 @@ import time
 import wandb
 from dataclasses import dataclass
 from argparse import Namespace
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -52,6 +53,8 @@ class Args(RL_Args):
     """coefficient for scaling the autotune entropy target"""
     checkpoint_frequency: int = 500
     """How often to save the agent during training"""
+    use_simple_exp_name: bool = True
+    """If True, use exp_name directly; if False, use SAC/{env_id}__{exp_name} format"""
 
 
 def layer_init(layer, bias_const=0.0):
@@ -123,7 +126,13 @@ def train(kwargs: Namespace) -> None:
     args = kwargs.SAC
 
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
-    run_name = f"SAC/{kwargs.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+
+    if args.use_simple_exp_name and args.exp_name:
+        # Use custom exp_name directly
+        run_name = args.exp_name
+    else:
+        # Use default format: SAC/{env_id}__{exp_name}
+        run_name = f"SAC/{kwargs.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
     writer, device, envs = setup(kwargs, args, run_name)
 
@@ -155,8 +164,13 @@ def train(kwargs: Namespace) -> None:
     )
     start_time = time.time()
 
+    # WSO tracking variables (for single env)
+    episode_sum_wso = 0.0
+    episode_max_wso = -np.inf
+    episode_last_wso = 0.0
+
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(args.total_timesteps):
+    for global_step in tqdm(range(args.total_timesteps), desc="SAC Training", unit="step"):
 
         if global_step % args.checkpoint_frequency == 0:
             torch.save(actor.state_dict(), f"{kwargs.save_folder}{run_name}/agent.pt")
@@ -171,15 +185,78 @@ def train(kwargs: Namespace) -> None:
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
+        # Update WSO tracking from growth info
+        if "growth" in infos:
+            growth_info = infos["growth"]
+            # Get the most recent WSO value (last key in growth dict)
+            for key in reversed(list(growth_info.keys())):
+                if isinstance(key, str) and key.startswith("_"):
+                    continue
+                values = growth_info.get(key)
+                if values is not None:
+                    wso_val = float(np.atleast_1d(values)[0])
+                    episode_last_wso = wso_val
+                    episode_sum_wso += wso_val
+                    if wso_val > episode_max_wso:
+                        episode_max_wso = wso_val
+                    break
+
+        # Handle episode completion (same logic as PPO for gymnasium compatibility)
+        episode_done = False
         if "final_info" in infos:
             for info in infos["final_info"]:
-                # Skip the envs that are not done
-                if "episode" not in info:
-                    continue
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                break
+                if info and "episode" in info:
+                    ep_return = info["episode"]["r"]
+                    ep_length = info["episode"]["l"]
+                    episode_done = True
+                    break
+        elif "episode" in infos:
+            # Alternative format used by some gymnasium versions
+            ep_info = infos["episode"]
+            completed_mask = ep_info.get("_r")
+            if completed_mask is None:
+                completed_mask = ep_info.get("_l")
+            if completed_mask is None:
+                completed_indices = range(len(np.atleast_1d(ep_info["r"])))
+            else:
+                mask = np.array(completed_mask, dtype=bool)
+                completed_indices = np.flatnonzero(mask)
+
+            if len(completed_indices) > 0:
+                returns_arr = np.asarray(ep_info["r"])
+                lengths_arr = np.asarray(ep_info["l"])
+                ep_return = float(returns_arr[completed_indices[0]])
+                ep_length = float(lengths_arr[completed_indices[0]])
+                episode_done = True
+
+        if episode_done:
+            # Get final WSO stats
+            max_wso = episode_max_wso if np.isfinite(episode_max_wso) else episode_last_wso
+            final_wso = episode_last_wso
+            sum_wso = episode_sum_wso
+
+            print(f"global_step={global_step}, episodic_return={ep_return:.2f}, "
+                  f"max_wso={max_wso:.2f}, final_wso={final_wso:.2f}, sum_wso={sum_wso:.2f}")
+
+            writer.add_scalar("charts/episodic_return", ep_return, global_step)
+            writer.add_scalar("charts/episodic_length", ep_length, global_step)
+            writer.add_scalar("episode/max_wso", max_wso, global_step)
+            writer.add_scalar("episode/final_wso", final_wso, global_step)
+            writer.add_scalar("episode/sum_wso", sum_wso, global_step)
+
+            if kwargs.track:
+                wandb.log({
+                    "charts/episodic_return": ep_return,
+                    "charts/episodic_length": ep_length,
+                    "episode/max_wso": max_wso,
+                    "episode/final_wso": final_wso,
+                    "episode/sum_wso": sum_wso
+                }, step=global_step)
+
+            # Reset WSO tracking for next episode
+            episode_sum_wso = 0.0
+            episode_max_wso = -np.inf
+            episode_last_wso = 0.0
 
         real_next_obs = next_obs.copy()
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
@@ -254,10 +331,27 @@ def train(kwargs: Namespace) -> None:
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+                sps = int(global_step / (time.time() - start_time))
+                print("SPS:", sps)
+                writer.add_scalar("charts/SPS", sps, global_step)
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+
+                # Log to wandb
+                if kwargs.track:
+                    log_dict = {
+                        "losses/qf1_values": qf1_a_values.mean().item(),
+                        "losses/qf2_values": qf2_a_values.mean().item(),
+                        "losses/qf1_loss": qf1_loss.item(),
+                        "losses/qf2_loss": qf2_loss.item(),
+                        "losses/qf_loss": qf_loss.item() / 2.0,
+                        "losses/actor_loss": actor_loss.item(),
+                        "losses/alpha": alpha,
+                        "charts/SPS": sps,
+                    }
+                    if args.autotune:
+                        log_dict["losses/alpha_loss"] = alpha_loss.item()
+                    wandb.log(log_dict, step=global_step)
 
         if global_step % args.checkpoint_frequency == 0:
             writer.add_scalar("charts/average_reward", eval_policy(actor, envs, kwargs, device), global_step)
