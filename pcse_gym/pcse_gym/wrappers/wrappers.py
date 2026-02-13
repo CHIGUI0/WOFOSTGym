@@ -886,7 +886,7 @@ class RewardWSODeltaWrapper(RewardWrapper):
         super().__init__(env)
         self.env = env
         self.prev_wso = 0.0
-        self.reward_range = [-1500, 500]  # Based on observed WSO delta range with margin
+        self.reward_range = [0, 500]
 
     def _get_reward(self, output: dict, act_tuple: tuple[float, float, float, float]) -> float:
         """Returns the change in WSO as reward.

@@ -209,6 +209,8 @@ def train(kwargs: Namespace) -> None:
                     if env_idx >= len(mask_arr) or not mask_arr[env_idx]:
                         continue
 
+                if values_arr[env_idx] is None:
+                    continue
                 wso_val = float(values_arr[env_idx])
                 episode_last_wso[env_idx] = wso_val
                 episode_sum_wso[env_idx] += wso_val
