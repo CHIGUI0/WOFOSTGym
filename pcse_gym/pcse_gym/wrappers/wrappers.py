@@ -786,6 +786,31 @@ class RewardFinalWSOWrapper(RewardWrapper):
         super().__init__(env)
         self.env = env
         self.reward_range = [0, 10000]
+        self.last_valid_wso = 0.0
+
+    @staticmethod
+    def _final_valid_wso_from_output_single(output: list[dict]) -> float:
+        """Get the last finite positive WSO from one simulation chunk.
+
+        With intvn_interval > 1, crop can mature before the last simulated day,
+        and the tail can contain 0/None/NaN. We therefore backtrack to the last
+        valid positive WSO.
+        """
+        fallback = 0.0
+        for day in reversed(output):
+            wso_raw = day.get("WSO")
+            if wso_raw is None:
+                continue
+            try:
+                wso_val = float(wso_raw)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(wso_val):
+                continue
+            if wso_val > 0.0:
+                return wso_val
+            fallback = wso_val
+        return fallback
 
     def _get_reward(self, output: dict, act_tuple: tuple[float, float, float, float]) -> float:
         """Returns WSO only at episode termination, 0 otherwise.
@@ -843,14 +868,20 @@ class RewardFinalWSOWrapper(RewardWrapper):
         truncation = self.env.unwrapped.date >= self.env.unwrapped.site_end_date
 
         # Sparse reward: only give WSO at termination or truncation
+        if isinstance(self.env.unwrapped, Multi_NPK_Env):
+            chunk_wso = sum(
+                [self._final_valid_wso_from_output_single(output[i]) for i in range(self.env.unwrapped.num_farms)]
+            )
+        else:
+            chunk_wso = self._final_valid_wso_from_output_single(output)
+
+        if np.isfinite(chunk_wso) and chunk_wso > 0.0:
+            self.last_valid_wso = chunk_wso
+
         if termination or truncation:
-            if isinstance(self.env.unwrapped, Multi_NPK_Env):
-                reward = sum(
-                    [output[i][-1]["WSO"] if output[i][-1]["WSO"] is not None else 0.0
-                     for i in range(self.env.unwrapped.num_farms)]
-                )
-            else:
-                reward = output[-1]["WSO"] if output[-1]["WSO"] is not None else 0.0
+            reward = chunk_wso
+            if (not np.isfinite(reward) or reward <= 0.0) and self.last_valid_wso > 0.0:
+                reward = self.last_valid_wso
         else:
             reward = 0.0
 
@@ -863,6 +894,12 @@ class RewardFinalWSOWrapper(RewardWrapper):
             self.env.unwrapped._log(output[-1]["WSO"], act_tuple, reward)
 
         return observation, reward, termination, truncation, self.env.unwrapped.log
+
+    def reset(self, **kwargs: dict) -> tuple[np.ndarray, dict]:
+        """Reset the environment and clear last valid WSO cache."""
+        obs, info = self.env.reset(**kwargs)
+        self.last_valid_wso = 0.0
+        return obs, info
 
 
 class RewardWSODeltaWrapper(RewardWrapper):

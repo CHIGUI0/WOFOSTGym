@@ -143,7 +143,7 @@ class WeatherDataContainer(SlotPickleMixin):
         "TMIN": (-50.0, 60.0),
         "TMAX": (-50.0, 60.0),
         "VAP": (0.06, 199.3),  # hPa, computed as sat. vapour pressure at -50, 60 Celsius
-        "RAIN": (0, 35.0),
+        "RAIN": (0, 100.0),
         "E0": (0.0, 2.5),
         "ES0": (0.0, 2.5),
         "ET0": (0.0, 2.5),
@@ -644,7 +644,7 @@ class NASAPowerWeatherDataProvider(WeatherDataProvider):
         """Query the NASA Power server for data on given latitude/longitude"""
 
         start_date = dt.date(1983, 7, 1)
-        end_date = dt.date.today()
+        end_date = dt.date(2020, 12, 31)
 
         # build URL for retrieving data, using new NASA POWER api
         server = "https://power.larc.nasa.gov/api/temporal/daily/point"
@@ -657,13 +657,22 @@ class NASAPowerWeatherDataProvider(WeatherDataProvider):
             "end": end_date.strftime("%Y%m%d"),
             "community": "AG",
             "format": "JSON",
-            "user": "anonymous",
+            "user": "agrimanager",
         }
         msg = "Starting retrieval from NASA Power"
         self.logger.debug(msg)
-        req = requests.get(server, params=payload)
 
-        if req.status_code != self.HTTP_OK:
+        import time, random
+        max_retries = 10
+        for attempt in range(max_retries):
+            req = requests.get(server, params=payload)
+            if req.status_code == self.HTTP_OK:
+                break
+            if req.status_code == 429 and attempt < max_retries - 1:
+                wait = min(2 ** attempt, 60) + random.uniform(1, 5)
+                self.logger.debug(f"Rate limited (429), retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+                continue
             msg = ("Failed retrieving POWER data, server returned HTTP " + "code: %i on following URL %s") % (
                 req.status_code,
                 req.url,

@@ -13,6 +13,6 @@ AgroManagement:
         crop_start_date: 1985-01-01
         crop_start_type: sowing
         crop_end_date: 1990-10-01
-        crop_end_type: max_duration
+        crop_end_type: maturity
         max_duration: 1100
 

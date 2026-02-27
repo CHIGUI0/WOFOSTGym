@@ -173,6 +173,7 @@ def train(kwargs: Namespace) -> None:
     episode_sum_wso = np.zeros(args.num_envs)
     episode_max_wso = np.full(args.num_envs, -np.inf)
     episode_last_wso = np.zeros(args.num_envs)
+    episode_last_valid_wso = np.zeros(args.num_envs)
 
     def update_wso_stats(growth_info: dict) -> None:
         """
@@ -211,9 +212,20 @@ def train(kwargs: Namespace) -> None:
 
                 if values_arr[env_idx] is None:
                     continue
-                wso_val = float(values_arr[env_idx])
+
+                try:
+                    wso_val = float(values_arr[env_idx])
+                except (TypeError, ValueError):
+                    continue
+
+                # Skip NaN/Inf so episode statistics remain finite.
+                if not np.isfinite(wso_val):
+                    continue
+
                 episode_last_wso[env_idx] = wso_val
-                episode_sum_wso[env_idx] += wso_val
+                if wso_val > 0.0:
+                    episode_last_valid_wso[env_idx] = wso_val
+                    episode_sum_wso[env_idx] += wso_val
                 if wso_val > episode_max_wso[env_idx]:
                     episode_max_wso[env_idx] = wso_val
                 updated_envs[env_idx] = True
@@ -223,6 +235,13 @@ def train(kwargs: Namespace) -> None:
 
     # Create progress bar - track batches/iterations
     pbar = tqdm(total=args.num_iterations, desc="Training Progress", unit="batch")
+
+    def finite_mean(values: list[float]) -> float | None:
+        arr = np.asarray(values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return None
+        return float(np.mean(arr))
 
     for iteration in range(1, args.num_iterations + 1):
         if global_step % args.checkpoint_frequency == 0:
@@ -281,9 +300,17 @@ def train(kwargs: Namespace) -> None:
             for env_idx, ep_return, ep_length in episode_updates:
                 max_wso = episode_max_wso[env_idx]
                 if not np.isfinite(max_wso):
-                    max_wso = episode_last_wso[env_idx]
+                    max_wso = episode_last_valid_wso[env_idx]
                 final_wso = episode_last_wso[env_idx]
+                if (not np.isfinite(final_wso) or final_wso <= 0.0) and episode_last_valid_wso[env_idx] > 0.0:
+                    # Mature crop can report 0/NaN at the tail of an intervention interval.
+                    # Fall back to last valid positive WSO, aligned with agrimanager/env behavior.
+                    final_wso = episode_last_valid_wso[env_idx]
+                if not np.isfinite(max_wso):
+                    max_wso = final_wso
                 sum_wso = episode_sum_wso[env_idx]
+                if not np.isfinite(sum_wso):
+                    sum_wso = 0.0
 
                 # Store episode stats for batch-level aggregation
                 batch_episode_returns.append(ep_return)
@@ -296,6 +323,7 @@ def train(kwargs: Namespace) -> None:
                 episode_max_wso[env_idx] = -np.inf
                 episode_sum_wso[env_idx] = 0.0
                 episode_last_wso[env_idx] = 0.0
+                episode_last_valid_wso[env_idx] = 0.0
 
                 print(
                     f"iteration={iteration}, env={env_idx}, episode_return={ep_return:.2f}, "
@@ -400,9 +428,9 @@ def train(kwargs: Namespace) -> None:
         if num_episodes_completed > 0:
             avg_episode_return = np.mean(batch_episode_returns)
             avg_episode_length = np.mean(batch_episode_lengths)
-            avg_episode_max_wso = np.mean(batch_episode_max_wso)
-            avg_episode_final_wso = np.mean(batch_episode_final_wso)
-            avg_episode_sum_wso = np.mean(batch_episode_sum_wso)
+            avg_episode_max_wso = finite_mean(batch_episode_max_wso)
+            avg_episode_final_wso = finite_mean(batch_episode_final_wso)
+            avg_episode_sum_wso = finite_mean(batch_episode_sum_wso)
 
             # Clear buffers for next batch
             batch_episode_returns.clear()
@@ -425,9 +453,12 @@ def train(kwargs: Namespace) -> None:
         if avg_episode_return is not None:
             writer.add_scalar("episode/avg_return", avg_episode_return, iteration)
             writer.add_scalar("episode/avg_length", avg_episode_length, iteration)
-            writer.add_scalar("episode/avg_max_wso", avg_episode_max_wso, iteration)
-            writer.add_scalar("episode/avg_final_wso", avg_episode_final_wso, iteration)
-            writer.add_scalar("episode/avg_sum_wso", avg_episode_sum_wso, iteration)
+            if avg_episode_max_wso is not None:
+                writer.add_scalar("episode/avg_max_wso", avg_episode_max_wso, iteration)
+            if avg_episode_final_wso is not None:
+                writer.add_scalar("episode/avg_final_wso", avg_episode_final_wso, iteration)
+            if avg_episode_sum_wso is not None:
+                writer.add_scalar("episode/avg_sum_wso", avg_episode_sum_wso, iteration)
             writer.add_scalar("episode/num_completed", num_episodes_completed, iteration)
 
         # Wandb logging - log once per batch/iteration
@@ -451,11 +482,14 @@ def train(kwargs: Namespace) -> None:
                 log_dict.update({
                     "episode/avg_return": avg_episode_return,
                     "episode/avg_length": avg_episode_length,
-                    "episode/avg_max_wso": avg_episode_max_wso,
-                    "episode/avg_final_wso": avg_episode_final_wso,
-                    "episode/avg_sum_wso": avg_episode_sum_wso,
                     "episode/num_completed": num_episodes_completed
                 })
+                if avg_episode_max_wso is not None:
+                    log_dict["episode/avg_max_wso"] = avg_episode_max_wso
+                if avg_episode_final_wso is not None:
+                    log_dict["episode/avg_final_wso"] = avg_episode_final_wso
+                if avg_episode_sum_wso is not None:
+                    log_dict["episode/avg_sum_wso"] = avg_episode_sum_wso
 
             wandb.log(log_dict, step=iteration)
 
