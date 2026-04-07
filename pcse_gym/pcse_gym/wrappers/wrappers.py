@@ -785,7 +785,10 @@ class RewardFinalWSOWrapper(RewardWrapper):
         """
         super().__init__(env)
         self.env = env
-        self.reward_range = [0, 10000]
+        # Normalize final reward as final_wso / 1000.
+        # This keeps sparse trajectory reward on a scale comparable to
+        # per-turn format bonuses used by downstream trainers.
+        self.reward_range = [0, 1000]
         self.last_valid_wso = 0.0
 
     @staticmethod

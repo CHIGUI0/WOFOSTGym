@@ -44,6 +44,12 @@ config = WOFOSTEnvConfig(
 - Final step (when terminated or truncated) receives the **final WSO** value
 - Encourages the agent to maximize final yield rather than short-term gains
 
+**Normalization**:
+- Automatically normalized by `NormalizeReward`
+- reward_range: `[0, 1000]`
+- Normalized formula: `normalized_reward = final_wso / 1000`
+- With observed final WSO roughly in `[0, ~7300]`, normalized rewards can exceed `1.0`
+
 **Limitations**:
 - WSO often declines after reaching peak maturity (avg 77% loss observed)
 - May not reflect true crop yield potential if episode ends after peak
@@ -164,6 +170,6 @@ The implementation tracks `prev_wso` across steps:
 - All wrappers handle None/NaN WSO values gracefully
 - Reward ranges (based on empirical observations from baselines):
   - **Daily WSO** (Default): [0, 10000] (borrowed from original code)
-  - **RewardFinalWSOWrapper**: [0, 10000] (observed final WSO range: [0, ~7300])
+  - **RewardFinalWSOWrapper**: [0, 1000] (normalized as `final_wso / 1000`; observed final WSO range: [0, ~7300])
   - **RewardPeakWSOWrapper**: [0, 15000] (observed peak WSO range: [0, ~12590])
   - **RewardWSODeltaWrapper**: [-1500, 500] (observed WSO delta range: [-1056, 363])
