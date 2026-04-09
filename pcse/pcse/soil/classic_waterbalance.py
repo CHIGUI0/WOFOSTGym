@@ -10,7 +10,7 @@ from datetime import date
 from math import sqrt
 
 from pcse.nasapower import WeatherDataContainer
-from pcse.utils.traitlets import Float, Int, Instance, Bool, List
+from pcse.utils.traitlets import Float, Int, Instance, Bool, List, Unicode
 from pcse.utils.decorators import prepare_rates, prepare_states
 from pcse.util import limit, Afgen
 from pcse.base import ParamTemplate, StatesTemplate, RatesTemplate, SimulationObject, VariableKiosk
@@ -792,6 +792,8 @@ class WaterbalancePP(SimulationObject):
     DEFAULT_RD = Float(10.0)
     # Increments on WLOW due to state updates
     _increments_W = List()
+    resource_blackout_active = Bool(False)
+    resource_blackout_target = Unicode("")
 
     class Parameters(ParamTemplate):
         # Soil parameters
@@ -953,6 +955,9 @@ class WaterbalancePP(SimulationObject):
             WBALTT=-999.0,
             TOTIRRIG=0.0,
         )
+
+        self.resource_blackout_active = False
+        self.resource_blackout_target = ""
         self.rates = self.RateVariables(
             kiosk, publish=["EVS", "EVW", "WTRA", "RIN", "RIRR", "PERC", "LOSS", "DW", "DWLOW", "DTSR", "DSS", "DRAINT"]
         )
@@ -1118,8 +1123,11 @@ class WaterbalancePP(SimulationObject):
         RDchange = RD - self.RDold
         self._redistribute_water(RDchange)
 
-        # mean soil moisture content in rooted zone
-        s.SM = p.SMFCF
+        # Publish a severe water-stress state during PP blackout windows.
+        if self.resource_blackout_active and self.resource_blackout_target in {"water", "npk_water", "all_resources"}:
+            s.SM = p.SMW
+        else:
+            s.SM = p.SMFCF
 
         # Accumulate days since oxygen stress, but only if a crop is present
         if s.SM >= (p.SM0 - p.CRAIRC):
@@ -1129,6 +1137,10 @@ class WaterbalancePP(SimulationObject):
 
         # save rooting depth
         self.RDold = RD
+
+    def set_resource_blackout(self, *, active: bool, target: str | None = None) -> None:
+        self.resource_blackout_active = bool(active)
+        self.resource_blackout_target = str(target or "")
 
     @prepare_states
     def finalize(self, day: date) -> None:

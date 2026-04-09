@@ -6,7 +6,7 @@ Modified by Will Solow, 2024
 
 from datetime import date
 
-from pcse.utils.traitlets import Instance
+from pcse.utils.traitlets import Instance, Bool, Unicode
 from pcse.nasapower import WeatherDataContainer
 from pcse.base import SimulationObject, VariableKiosk
 
@@ -26,6 +26,8 @@ class BaseSoilModuleWrapper(SimulationObject):
 
     WaterbalanceFD = Instance(SimulationObject)
     NPK_Soil_Dynamics = Instance(SimulationObject)
+    resource_blackout_active = Bool(False)
+    resource_blackout_target = Unicode("")
 
     def initialize(self, day: date, kiosk: VariableKiosk, parvalues: dict) -> None:
         msg = "`initialize` method not yet implemented on %s" % self.__class__.__name__
@@ -40,6 +42,15 @@ class BaseSoilModuleWrapper(SimulationObject):
         """Integrate state rates"""
         self.WaterbalanceFD.integrate(day, delt)
         self.NPK_Soil_Dynamics.integrate(day, delt)
+
+    def set_resource_blackout(self, *, active: bool, target: str | None = None) -> None:
+        self.resource_blackout_active = bool(active)
+        self.resource_blackout_target = str(target or "")
+        for component_name in ("WaterbalanceFD", "NPK_Soil_Dynamics"):
+            component = getattr(self, component_name, None)
+            setter = getattr(component, "set_resource_blackout", None)
+            if callable(setter):
+                setter(active=bool(active), target=str(target or ""))
 
 
 class SoilModuleWrapper_LNPKW(BaseSoilModuleWrapper):

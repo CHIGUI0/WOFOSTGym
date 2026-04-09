@@ -158,6 +158,8 @@ class NPK_Env(gym.Env):
         self.state = None
         self.isopen = True
         self.assets = args.assets_fpath
+        self.resource_blackout_config = None
+        self._decision_turn_idx = 0
 
     def get_output_vars(self) -> list[str]:
         """Return a list of the output vars"""
@@ -199,6 +201,7 @@ class NPK_Env(gym.Env):
                 year: year to reset enviroment to for weather
                 location: (latitude, longitude). Location to set environment to"""
         self.log = self._init_log()
+        self._decision_turn_idx = 0
         if "year" in kwargs:
             self.year = kwargs["year"]
             if (
@@ -250,6 +253,7 @@ class NPK_Env(gym.Env):
         self.model = Wofost8Engine(
             self.parameterprovider, self.weatherdataprovider, self.agromanagement, config=self.config
         )
+        self._set_resource_blackout_state(active=False)
 
         output = self._run_simulation()
         observation = self._process_output(output)
@@ -260,6 +264,29 @@ class NPK_Env(gym.Env):
             self.render()
 
         return observation, self.log
+
+    def set_resource_blackout_config(self, config: dict | None) -> None:
+        """Store a per-turn resource blackout config for PP experiments."""
+        self.resource_blackout_config = dict(config or {})
+        self._set_resource_blackout_state(active=False)
+
+    def _is_resource_blackout_active_for_turn(self, turn_idx: int) -> tuple[bool, str | None]:
+        config = self.resource_blackout_config or {}
+        if not config or not config.get("enabled", False):
+            return False, None
+        if str(config.get("mode", "")) != "resource_blackout_window":
+            return False, None
+        start_turn_idx = int(config.get("start_turn_idx", 0) or 0)
+        end_turn_idx = int(config.get("end_turn_idx", 0) or 0)
+        if start_turn_idx <= 0 or end_turn_idx < start_turn_idx:
+            return False, None
+        target = config.get("target")
+        return start_turn_idx <= int(turn_idx) <= end_turn_idx, (str(target) if target else None)
+
+    def _set_resource_blackout_state(self, *, active: bool, target: str | None = None) -> None:
+        soil = getattr(self.model, "soil", None)
+        if soil is not None and hasattr(soil, "set_resource_blackout"):
+            soil.set_resource_blackout(active=bool(active), target=target)
 
     def domain_randomization_uniform(self, scale: float = 0.1) -> None:
         """
@@ -303,8 +330,14 @@ class NPK_Env(gym.Env):
             msg = f"Action must be of type `int` but is of type `dict`. Wrap environment in `pcse_gym.wrappers.NPKDictActionWrapper` before proceeding."
             raise Exception(msg)
 
-        act_tuple = self._take_action(action)
-        output = self._run_simulation()
+        decision_turn_idx = self._decision_turn_idx + 1
+        blackout_active, blackout_target = self._is_resource_blackout_active_for_turn(decision_turn_idx)
+        self._set_resource_blackout_state(active=blackout_active, target=blackout_target)
+        try:
+            act_tuple = self._take_action(action)
+            output = self._run_simulation()
+        finally:
+            self._set_resource_blackout_state(active=False)
         observation = self._process_output(output)
 
         reward = self._get_reward(output, act_tuple)
@@ -321,6 +354,7 @@ class NPK_Env(gym.Env):
 
         if self.render_mode == "human":
             self.render()
+        self._decision_turn_idx = decision_turn_idx
         return observation, reward, termination, truncation, self.log
 
     def _validate(self) -> None:

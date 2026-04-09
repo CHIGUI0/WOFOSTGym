@@ -9,7 +9,7 @@ Modified by Will Solow, 2024
 from datetime import date
 
 from pcse.util import AfgenTrait
-from pcse.utils.traitlets import Float
+from pcse.utils.traitlets import Float, Bool, Unicode
 from pcse.utils.decorators import prepare_rates, prepare_states
 from pcse.base import ParamTemplate, StatesTemplate, RatesTemplate, SimulationObject
 from pcse.utils import signals
@@ -423,6 +423,9 @@ class NPK_Soil_Dynamics_PP(NPK_Soil_Dynamics):
 
     """
 
+    resource_blackout_active = Bool(False)
+    resource_blackout_target = Unicode("")
+
     def initialize(self, day: date, kiosk: VariableKiosk, parvalues: dict) -> None:
         """
         :param day: start date of the simulation
@@ -431,6 +434,8 @@ class NPK_Soil_Dynamics_PP(NPK_Soil_Dynamics):
         """
 
         super().initialize(day, kiosk, parvalues)
+        self.resource_blackout_active = False
+        self.resource_blackout_target = ""
 
     @prepare_states
     def integrate(self, day: date, delt: float = 1.0) -> None:
@@ -448,10 +453,21 @@ class NPK_Soil_Dynamics_PP(NPK_Soil_Dynamics):
         states.PSOIL += rates.RPSOIL * delt
         states.KSOIL += rates.RKSOIL * delt
 
-        # total (soil + fertilizer) NPK amount in soil
-        states.NAVAIL = params.NMAX
-        states.PAVAIL = params.PMAX
-        states.KAVAIL = params.KMAX
+        # Publish zero available nutrients during PP blackout windows.
+        target = str(self.resource_blackout_target or "")
+        if self.resource_blackout_active and target in {"npk", "npk_water", "all_resources"}:
+            states.NAVAIL = 0.0
+            states.PAVAIL = 0.0
+            states.KAVAIL = 0.0
+            return
+
+        states.NAVAIL = 0.0 if self.resource_blackout_active and target == "n" else params.NMAX
+        states.PAVAIL = 0.0 if self.resource_blackout_active and target == "p" else params.PMAX
+        states.KAVAIL = 0.0 if self.resource_blackout_active and target == "k" else params.KMAX
+
+    def set_resource_blackout(self, *, active: bool, target: str | None = None) -> None:
+        self.resource_blackout_active = bool(active)
+        self.resource_blackout_target = str(target or "")
 
 
 class NPK_Soil_Dynamics_LN(NPK_Soil_Dynamics):
